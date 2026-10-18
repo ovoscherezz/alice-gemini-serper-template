@@ -1,4 +1,5 @@
-const DEFAULT_MODEL = "gemini-2.5-flash";
+
+const DEFAULT_MODEL = "gemini-3.8-flash";
 const MAX_HISTORY_MESSAGES = 8;
 const MAX_HISTORY_MESSAGE_CHARS = 1200;
 const MAX_ALICE_TEXT = 1024;
@@ -6,24 +7,23 @@ const TOTAL_RESPONSE_BUDGET_MS = 4200;
 const SERPER_TIMEOUT_MS = 400;
 const GEMINI_TIMEOUT_MS = 3500;
 
+// Необязательная настройка в Vercel:
+// JARVIS_TTS_EFFECT = pitch_down
+const TTS_EFFECT =
+  process.env.JARVIS_TTS_EFFECT === "pitch_down"
+    ? "pitch_down"
+    : "";
+
 const SYSTEM_PROMPT = [
-  "Ты — полезный голосовой помощник в навыке Яндекс Алисы.",
+  "Ты — Джарвис, персональный интеллектуальный голосовой помощник.",
+  "Твой характер — спокойный, уверенный, интеллигентный, с лёгкой уместной иронией.",
+  "Обращайся к пользователю на вы. Говори о себе в мужском роде.",
   "Отвечай естественно, по-русски, кратко и так, чтобы ответ было удобно слушать.",
-  "Обычно используй 1–3 коротких предложения. Не используй Markdown, таблицы, списки с символами или длинные вступления.",
-  "Если вопрос требует актуальных данных и переданы результаты поиска, опирайся на них; не выдумывай отсутствующие факты.",
+  "Обычно используй 1–3 коротких предложения. Не используй Markdown, таблицы и длинные вступления.",
+  "Не начинай каждый ответ с приветствия. Не называй себя Алисой или Gemini.",
+  "Если вопрос требует актуальных данных и переданы результаты поиска, опирайся на них.",
   "Если не знаешь ответа, честно скажи об этом."
 ].join(" ");
-
-function aliceResponse(text, endSession = false, history = []) {
-  return {
-    version: "1.0",
-    response: {
-      text: fitAliceText(text),
-      end_session: endSession
-    },
-    session_state: { history }
-  };
-}
 
 function fitAliceText(value) {
   const text = String(value ?? "")
@@ -47,11 +47,37 @@ function fitAliceText(value) {
   }
 
   const lastSpace = candidate.lastIndexOf(" ");
+
   return (
     lastSpace > 200
       ? candidate.slice(0, lastSpace)
       : candidate
   ).trim() + "…";
+}
+
+function aliceResponse(text, endSession = false, history = []) {
+  const answer = fitAliceText(text);
+
+  const response = {
+    text: answer,
+    end_session: endSession
+  };
+
+  if (TTS_EFFECT) {
+    const escaped = answer
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;");
+
+    response.tts =
+      `<speaker effect="${TTS_EFFECT}">${escaped}`;
+  }
+
+  return {
+    version: "1.0",
+    response,
+    session_state: { history }
+  };
 }
 
 function isSearchIntent(text) {
@@ -77,6 +103,7 @@ function safeHistory(history) {
 
 async function fetchJson(url, options, timeoutMs) {
   const controller = new AbortController();
+
   const timer = setTimeout(
     () => controller.abort(),
     Math.max(100, timeoutMs)
@@ -89,6 +116,7 @@ async function fetchJson(url, options, timeoutMs) {
     });
 
     const data = await response.json().catch(() => ({}));
+
     return { response, data };
   } finally {
     clearTimeout(timer);
@@ -97,6 +125,7 @@ async function fetchJson(url, options, timeoutMs) {
 
 async function searchWeb(query, timeoutMs) {
   const key = process.env.SERPER_API_KEY;
+
   if (!key || timeoutMs < 150) return "";
 
   try {
@@ -119,10 +148,7 @@ async function searchWeb(query, timeoutMs) {
     );
 
     if (!response.ok) {
-      console.warn(
-        "Serper request failed with HTTP",
-        response.status
-      );
+      console.warn("Serper HTTP status:", response.status);
       return "";
     }
 
@@ -147,10 +173,10 @@ async function searchWeb(query, timeoutMs) {
       );
     }
 
-    return items.length ? items.join("\n") : "";
-  } catch (error) {
+    return items.join("\n");
+  } catch {
     console.warn(
-      "Serper request did not finish in time; continuing without search."
+      "Serper timed out or failed; continuing without search."
     );
     return "";
   }
@@ -160,6 +186,7 @@ async function askGemini(text, history, searchContext, timeoutMs) {
   const key = process.env.GEMINI_API_KEY;
 
   if (!key) throw new Error("MISSING_GEMINI_KEY");
+
   if (timeoutMs < 250) {
     throw new Error("TIME_BUDGET_EXHAUSTED");
   }
@@ -188,42 +215,70 @@ async function askGemini(text, history, searchContext, timeoutMs) {
     parts: [{ text: prompt }]
   });
 
-  const { response, data } = await fetchJson(
-    `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-goog-api-key": key
-      },
-      body: JSON.stringify({
-        systemInstruction: {
-          parts: [{ text: SYSTEM_PROMPT }]
+  const generationConfig = {
+    temperature: 0.4,
+    maxOutputTokens: 512
+  };
+
+  const thinkingLevel = String(
+    process.env.GEMINI_THINKING_LEVEL || "low"
+  ).toLowerCase();
+
+  if (
+    /^gemini-3(?:[.-]|$)/.test(model) &&
+    ["minimal", "low", "medium", "high"].includes(thinkingLevel)
+  ) {
+    generationConfig.thinkingConfig = {
+      thinkingLevel
+    };
+  }
+
+  const startedAt = Date.now();
+  let result;
+
+  try {
+    result = await fetchJson(
+      `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-goog-api-key": key
         },
-        contents,
-        generationConfig: {
-          temperature: 0.5,
-          maxOutputTokens: 240
-        }
-      })
-    },
-    Math.min(GEMINI_TIMEOUT_MS, timeoutMs)
-  );
+        body: JSON.stringify({
+          systemInstruction: {
+            parts: [{ text: SYSTEM_PROMPT }]
+          },
+          contents,
+          generationConfig
+        })
+      },
+      Math.min(GEMINI_TIMEOUT_MS, timeoutMs)
+    );
+  } finally {
+    console.log(
+      "Gemini request duration ms:",
+      Date.now() - startedAt
+    );
+  }
+
+  const { response, data } = result;
 
   if (!response.ok) {
     const status = Number(response.status);
-
-    // Диагностика: записываем код и сообщение Google,
-    // не выводя API-ключ.
     const googleError = data?.error || {};
+
     console.error("Gemini HTTP status:", status);
     console.error("Gemini model used:", model);
+
     console.error(
       "Gemini error details:",
       JSON.stringify({
         code: googleError.code,
         status: googleError.status,
-        message: String(googleError.message || "").slice(0, 1000)
+        message: String(
+          googleError.message || ""
+        ).slice(0, 1000)
       })
     );
 
@@ -260,7 +315,9 @@ async function askGemini(text, history, searchContext, timeoutMs) {
   }
 
   if (candidate?.finishReason === "MAX_TOKENS") {
-    console.warn("Gemini reached the output token limit.");
+    console.warn(
+      "Gemini reached the output token limit."
+    );
   }
 
   return answer;
@@ -269,23 +326,23 @@ async function askGemini(text, history, searchContext, timeoutMs) {
 function errorForUser(error) {
   switch (error?.message) {
     case "MISSING_GEMINI_KEY":
-      return "Сервер пока не настроен. Проверьте переменную GEMINI_API_KEY в настройках Vercel.";
+      return "Сервер пока не настроен. Проверьте ключ Gemini в Vercel.";
 
     case "GEMINI_KEY_REJECTED":
-      return "Не удалось подключиться к Gemini. Проверьте API-ключ в настройках Vercel.";
+      return "Не удалось подключиться к Gemini. Проверьте API-ключ.";
 
     case "GEMINI_QUOTA":
-      return "Сейчас превышен лимит запросов к Gemini. Попробуйте немного позже.";
+      return "Сейчас превышен лимит запросов к Gemini. Попробуйте позже.";
 
     case "GEMINI_MODEL_NOT_FOUND":
       return "Выбранная модель Gemini недоступна. Проверьте настройки модели.";
 
     case "GEMINI_BLOCKED":
-      return "Я не смогла обработать этот запрос. Попробуйте спросить иначе.";
+      return "Я не смог обработать этот запрос. Попробуйте спросить иначе.";
 
     case "TIME_BUDGET_EXHAUSTED":
     case "AbortError":
-      return "Не успела подготовить ответ. Попробуйте задать вопрос ещё раз, чуть короче.";
+      return "Не успел подготовить ответ. Попробуйте задать вопрос ещё раз, чуть короче.";
 
     default:
       return "Не получилось получить ответ от нейросети. Попробуйте ещё раз чуть позже.";
@@ -297,18 +354,21 @@ export default async function handler(req, res) {
     return res.status(200).json({
       ok: true,
       service: "alice-gemini-serper",
-      message: "Webhook is ready. Yandex Dialogs should send POST requests to /api/index."
+      message:
+        "Webhook is ready. Yandex Dialogs should send POST requests to /api."
     });
   }
 
   if (req.method !== "POST") {
     res.setHeader("Allow", "GET, POST");
+
     return res.status(405).json({
       error: "Method not allowed"
     });
   }
 
   const startedAt = Date.now();
+
   const remainingMs = () =>
     TOTAL_RESPONSE_BUDGET_MS - (Date.now() - startedAt);
 
@@ -330,7 +390,7 @@ export default async function handler(req, res) {
   if (!text) {
     return res.status(200).json(
       aliceResponse(
-        "Привет! Я могу ответить на вопрос или найти актуальную информацию. Что хочешь узнать?",
+        "Здравствуйте. Я Джарвис, ваш персональный помощник. Чем могу быть полезен?",
         false,
         oldHistory
       )
