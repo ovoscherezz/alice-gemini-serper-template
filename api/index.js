@@ -10,13 +10,13 @@ const SERPER_TIMEOUT_MS = 400;
 const GEMINI_TIMEOUT_MS = 3500;
 
 const FISH_VOICE_ID = "c47719f52ce34cc193b9bc2f00565e8a";
-
-// Пробуем бесплатную модель Fish Audio.
-// Платная модель s2.1-pro пока не используется.
 const FISH_MODEL = "s2.1-pro-free";
 
 const FISH_TIMEOUT_MS = 3000;
 const YANDEX_TIMEOUT_MS = 900;
+
+const DIAGNOSTIC_FISH_TIMEOUT_MS = 25000;
+const DIAGNOSTIC_YANDEX_TIMEOUT_MS = 12000;
 
 const JARVIS_AUDIO_ID =
   "df9659fd-b6ef-4455-b2ea-e6546088a040";
@@ -100,12 +100,7 @@ function aliceResponse(text, endSession = false, history = []) {
   };
 }
 
-function audioResponse(
-  text,
-  skillId,
-  audioId,
-  history = []
-) {
+function audioResponse(text, skillId, audioId, history = []) {
   const result = aliceResponse(text, false, history);
 
   if (skillId && audioId) {
@@ -116,8 +111,6 @@ function audioResponse(
   return result;
 }
 
-// Проверка ранее загруженного голоса.
-// Сохраняем рабочий способ воспроизведения.
 function jarvisVoiceTest(skillId, history = []) {
   return audioResponse(
     "Добрый вечер, сэр. Все системы работают в штатном режиме. Чем могу быть полезен?",
@@ -145,13 +138,8 @@ function isFishTestCommand(text) {
   );
 }
 
-// Новая команда: проверяет только Fish Audio.
-// Не вызывает Gemini и не загружает файл в Яндекс.
 function isFishConnectionTestCommand(text) {
-  return /^(джарвис[\s,.!]*)?проверка fish audio[.!?]*$/i.test(
-    String(text || "").trim()
-  ) ||
-  /^(джарвис[\s,.!]*)?проверка фиш аудио[.!?]*$/i.test(
+  return /^(джарвис[\s,.!]*)?проверка (fish audio|фиш аудио)[.!?]*$/i.test(
     String(text || "").trim()
   );
 }
@@ -230,7 +218,6 @@ async function checkYandexConnection(timeoutMs) {
   return data;
 }
 
-// Генерирует MP3 через бесплатную модель Fish Audio.
 async function generateFishAudio(text, timeoutMs) {
   const key = process.env.FISH_API_KEY;
 
@@ -244,6 +231,8 @@ async function generateFishAudio(text, timeoutMs) {
     () => controller.abort(),
     Math.max(100, timeoutMs)
   );
+
+  const startedAt = Date.now();
 
   try {
     console.log("Fish model:", FISH_MODEL);
@@ -270,19 +259,13 @@ async function generateFishAudio(text, timeoutMs) {
     if (!response.ok) {
       console.warn("Fish Audio HTTP:", response.status);
 
-      let errorBody = "";
+      const errorBody = await response
+        .text()
+        .catch(() => "");
 
-      try {
-        errorBody = await response.text();
-      } catch {
-        errorBody = "";
-      }
-
-      // Не выводим в журнал ключи и другие секреты.
-      // Показываем только ограниченную диагностическую информацию.
       console.warn(
         "Fish error details:",
-        errorBody.slice(0, 500)
+        errorBody.slice(0, 300)
       );
 
       if (response.status === 401 || response.status === 403) {
@@ -330,7 +313,9 @@ async function generateFishAudio(text, timeoutMs) {
 
     console.log(
       "Fish audio generated successfully. Bytes:",
-      audio.byteLength
+      audio.byteLength,
+      "Duration ms:",
+      Date.now() - startedAt
     );
 
     return audio;
@@ -407,6 +392,10 @@ async function getYandexSound(
     throw new Error("MISSING_YANDEX_TOKEN");
   }
 
+  if (!skillId || !soundId) {
+    throw new Error("MISSING_SOUND_ID");
+  }
+
   const { response, data } = await fetchJson(
     `https://dialogs.yandex.net/api/v1/skills/${encodeURIComponent(skillId)}/sounds/${encodeURIComponent(soundId)}`,
     {
@@ -419,16 +408,173 @@ async function getYandexSound(
   );
 
   if (!response.ok) {
+    console.warn(
+      "Yandex sound status HTTP:",
+      response.status
+    );
+
     throw new Error("YANDEX_SOUND_STATUS_FAILED");
   }
 
   return data?.sound || null;
 }
 
+// Защищённый диагностический режим.
+// Секрет передаётся в заголовке, не в адресе страницы.
+function diagnosticAuthorized(req) {
+  const expected = process.env.JARVIS_DIAGNOSTIC_TOKEN;
+
+  if (!expected || expected.length < 20) {
+    return false;
+  }
+
+  const supplied =
+    req.headers["x-jarvis-diagnostic-token"];
+
+  if (
+    typeof supplied !== "string" ||
+    supplied.length !== expected.length
+  ) {
+    return false;
+  }
+
+  let diff = 0;
+
+  for (let i = 0; i < expected.length; i++) {
+    diff |=
+      expected.charCodeAt(i) ^
+      supplied.charCodeAt(i);
+  }
+
+  return diff === 0;
+}
+
+function diagnosticError(error) {
+  if (error?.name === "AbortError") {
+    return "TIMEOUT";
+  }
+
+  return String(
+    error?.message || "UNKNOWN_ERROR"
+  ).slice(0, 80);
+}
+
+async function handleDiagnostic(req, res) {
+  res.setHeader("Cache-Control", "no-store");
+
+  if (!diagnosticAuthorized(req)) {
+    return res.status(401).json({
+      ok: false,
+      error: "UNAUTHORIZED"
+    });
+  }
+
+  const body =
+    req.body && typeof req.body === "object"
+      ? req.body
+      : {};
+
+  const action = String(body.action || "");
+  const skillId = String(body.skillId || "").trim();
+
+  if (!/^[a-zA-Z0-9-]{10,100}$/.test(skillId)) {
+    return res.status(400).json({
+      ok: false,
+      error: "INVALID_SKILL_ID"
+    });
+  }
+
+  if (action === "status") {
+    const soundId =
+      String(body.soundId || "").trim();
+
+    if (!/^[a-zA-Z0-9-]{10,100}$/.test(soundId)) {
+      return res.status(400).json({
+        ok: false,
+        error: "INVALID_SOUND_ID"
+      });
+    }
+
+    try {
+      const sound = await getYandexSound(
+        skillId,
+        soundId,
+        DIAGNOSTIC_YANDEX_TIMEOUT_MS
+      );
+
+      return res.status(200).json({
+        ok: true,
+        action,
+        soundId,
+        processed: sound?.isProcessed === true,
+        sound: sound
+          ? {
+              id: sound.id,
+              isProcessed: sound.isProcessed
+            }
+          : null
+      });
+    } catch (error) {
+      return res.status(200).json({
+        ok: false,
+        stage: "yandex_status",
+        error: diagnosticError(error)
+      });
+    }
+  }
+
+  if (action !== "generate") {
+    return res.status(400).json({
+      ok: false,
+      error: "INVALID_ACTION"
+    });
+  }
+
+  let audio;
+
+  try {
+    audio = await generateFishAudio(
+      TEST_PHRASE,
+      DIAGNOSTIC_FISH_TIMEOUT_MS
+    );
+  } catch (error) {
+    return res.status(200).json({
+      ok: false,
+      stage: "fish",
+      error: diagnosticError(error)
+    });
+  }
+
+  try {
+    const sound = await uploadYandexSound(
+      skillId,
+      audio,
+      DIAGNOSTIC_YANDEX_TIMEOUT_MS
+    );
+
+    return res.status(200).json({
+      ok: true,
+      stage: "uploaded",
+      soundId: sound.id,
+      processed: sound.isProcessed === true,
+      audioBytes: audio.byteLength
+    });
+  } catch (error) {
+    return res.status(200).json({
+      ok: false,
+      stage: "yandex_upload",
+      error: diagnosticError(error),
+      audioBytes: audio.byteLength
+    });
+  }
+}
+
 async function searchWeb(query, timeoutMs) {
   const key = process.env.SERPER_API_KEY;
 
-  if (!key || timeoutMs < 150) return "";
+  if (!key || timeoutMs < 150) {
+    return "";
+  }
 
   try {
     const { response, data } = await fetchJson(
@@ -450,7 +596,11 @@ async function searchWeb(query, timeoutMs) {
     );
 
     if (!response.ok) {
-      console.warn("Serper HTTP status:", response.status);
+      console.warn(
+        "Serper HTTP status:",
+        response.status
+      );
+
       return "";
     }
 
@@ -459,15 +609,21 @@ async function searchWeb(query, timeoutMs) {
     )
       .slice(0, 3)
       .map((item, i) => {
-        const title = String(item.title || "").slice(0, 180);
-        const snippet = String(item.snippet || "").slice(0, 350);
-        const link = String(item.link || "").slice(0, 240);
+        const title =
+          String(item.title || "").slice(0, 180);
+
+        const snippet =
+          String(item.snippet || "").slice(0, 350);
+
+        const link =
+          String(item.link || "").slice(0, 240);
 
         return `${i + 1}. ${title}: ${snippet} ${link}`.trim();
       });
 
     const answerBox =
-      data.answerBox?.answer || data.answerBox?.snippet;
+      data.answerBox?.answer ||
+      data.answerBox?.snippet;
 
     if (answerBox) {
       items.unshift(
@@ -480,6 +636,7 @@ async function searchWeb(query, timeoutMs) {
     console.warn(
       "Serper timed out or failed; continuing without search."
     );
+
     return "";
   }
 }
@@ -510,10 +667,12 @@ async function askGemini(
 
   console.log("Gemini model:", model);
 
-  const contents = safeHistory(history).map(item => ({
-    role: item.role,
-    parts: [{ text: item.text }]
-  }));
+  const contents = safeHistory(history).map(
+    item => ({
+      role: item.role,
+      parts: [{ text: item.text }]
+    })
+  );
 
   const prompt = searchContext
     ? `${text}\n\nРезультаты поиска в интернете:\n${searchContext}\nИспользуй их только там, где они относятся к вопросу.`
@@ -535,7 +694,9 @@ async function askGemini(
 
   if (
     /^gemini-3(?:[.-]|$)/.test(model) &&
-    ["minimal", "low", "medium", "high"].includes(thinkingLevel)
+    ["minimal", "low", "medium", "high"].includes(
+      thinkingLevel
+    )
   ) {
     generationConfig.thinkingConfig = {
       thinkingLevel
@@ -610,7 +771,9 @@ async function askGemini(
 
   const answer = (candidate?.content?.parts || [])
     .map(part =>
-      typeof part.text === "string" ? part.text : ""
+      typeof part.text === "string"
+        ? part.text
+        : ""
     )
     .join("")
     .trim();
@@ -714,7 +877,12 @@ export default async function handler(req, res) {
       service: "alice-gemini-serper",
       fishConfigured: Boolean(process.env.FISH_API_KEY),
       fishModel: FISH_MODEL,
-      yandexConfigured: Boolean(process.env.YANDEX_OAUTH_TOKEN),
+      yandexConfigured: Boolean(
+        process.env.YANDEX_OAUTH_TOKEN
+      ),
+      diagnosticConfigured: Boolean(
+        process.env.JARVIS_DIAGNOSTIC_TOKEN
+      ),
       message: "Webhook is ready."
     });
   }
@@ -727,10 +895,20 @@ export default async function handler(req, res) {
     });
   }
 
+  // Отдельный диагностический режим.
+  // Обычные запросы Алисы не затрагиваются.
+  if (
+    req.headers["x-jarvis-diagnostic-token"] !==
+    undefined
+  ) {
+    return handleDiagnostic(req, res);
+  }
+
   const startedAt = Date.now();
 
   const remainingMs = () =>
-    TOTAL_RESPONSE_BUDGET_MS - (Date.now() - startedAt);
+    TOTAL_RESPONSE_BUDGET_MS -
+    (Date.now() - startedAt);
 
   const body =
     req.body && typeof req.body === "object"
@@ -751,16 +929,16 @@ export default async function handler(req, res) {
     body?.session?.skill_id || ""
   ).trim();
 
-  // Проверка ранее загруженного голоса.
   if (isVoiceTestCommand(text)) {
-    console.log("Jarvis audio test: no Gemini request.");
+    console.log(
+      "Jarvis audio test: no Gemini request."
+    );
 
     return res.status(200).json(
       jarvisVoiceTest(skillId, oldHistory)
     );
   }
 
-  // Проверка подключения к Яндекс Диалогам.
   if (isConnectionTestCommand(text)) {
     try {
       const status = await checkYandexConnection(
@@ -769,7 +947,9 @@ export default async function handler(req, res) {
 
       console.log(
         "Yandex connection OK. Sound quota:",
-        JSON.stringify(status?.sounds?.quota || {})
+        JSON.stringify(
+          status?.sounds?.quota || {}
+        )
       );
 
       return res.status(200).json(
@@ -795,8 +975,6 @@ export default async function handler(req, res) {
     }
   }
 
-  // Новая отдельная проверка бесплатного Fish Audio.
-  // Не загружает запись в Яндекс Диалоги.
   if (isFishConnectionTestCommand(text)) {
     try {
       const audio = await generateFishAudio(
@@ -814,8 +992,7 @@ export default async function handler(req, res) {
 
       return res.status(200).json(
         aliceResponse(
-          "Проверка завершена успешно. Бесплатная модель Fish Audio создала голос Джарвиса. " +
-          "Теперь можно проверить загрузку записи в Яндекс Диалоги.",
+          "Проверка завершена успешно. Бесплатная модель Fish Audio создала голос Джарвиса. Теперь можно проверить загрузку записи в Яндекс Диалоги.",
           false,
           oldHistory
         )
@@ -838,7 +1015,6 @@ export default async function handler(req, res) {
     }
   }
 
-  // Генерация тестового голоса и загрузка в Яндекс.
   if (isFishTestCommand(text)) {
     try {
       if (!skillId) {
@@ -849,7 +1025,10 @@ export default async function handler(req, res) {
         TEST_PHRASE,
         Math.min(
           FISH_TIMEOUT_MS,
-          Math.max(100, remainingMs() - 1200)
+          Math.max(
+            100,
+            remainingMs() - 1200
+          )
         )
       );
 
@@ -858,7 +1037,10 @@ export default async function handler(req, res) {
         audio,
         Math.min(
           YANDEX_TIMEOUT_MS,
-          Math.max(100, remainingMs() - 300)
+          Math.max(
+            100,
+            remainingMs() - 300
+          )
         )
       );
 
@@ -875,9 +1057,7 @@ export default async function handler(req, res) {
 
       return res.status(200).json(
         aliceResponse(
-          "Fish Audio создал запись, а Яндекс принял её на обработку. " +
-          "Идентификатор записи сохранён в журнале Vercel. " +
-          "Для воспроизведения нужно дождаться обработки.",
+          "Fish Audio создал запись, а Яндекс принял её на обработку. Идентификатор записи сохранён в журнале Vercel. Для воспроизведения нужно дождаться обработки.",
           false,
           oldHistory
         )
@@ -921,7 +1101,10 @@ export default async function handler(req, res) {
         text,
         Math.min(
           SERPER_TIMEOUT_MS,
-          Math.max(0, remainingMs() - 2600)
+          Math.max(
+            0,
+            remainingMs() - 2600
+          )
         )
       );
     }
