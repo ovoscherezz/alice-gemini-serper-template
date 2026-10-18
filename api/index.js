@@ -9,12 +9,10 @@ const TOTAL_RESPONSE_BUDGET_MS = 4200;
 const SERPER_TIMEOUT_MS = 400;
 const GEMINI_TIMEOUT_MS = 3500;
 
-// Загруженный в Яндекс Диалоги звук Джарвиса.
+// Идентификатор аудиофайла, загруженного в Яндекс Диалоги.
 const JARVIS_AUDIO_ID =
   "df9659fd-b6ef-4455-b2ea-e6546088a040";
 
-// Необязательная настройка Vercel:
-// JARVIS_TTS_EFFECT = pitch_down
 const TTS_EFFECT =
   process.env.JARVIS_TTS_EFFECT === "pitch_down"
     ? "pitch_down"
@@ -87,17 +85,23 @@ function aliceResponse(text, endSession = false, history = []) {
   };
 }
 
-// Проверка загруженного голоса без обращения к Gemini.
-function jarvisVoiceTest(history = []) {
+// Проверка загруженного голоса без Gemini.
+// ID навыка автоматически приходит от Яндекса.
+function jarvisVoiceTest(skillId, history = []) {
   const result = aliceResponse(
     "Добрый вечер, сэр. Все системы работают в штатном режиме. Чем могу быть полезен?",
     false,
     history
   );
 
-  // Синтаксис звуковых ресурсов Яндекс Диалогов.
-  result.response.tts =
-    `<speaker audio="dialogs-upload/${JARVIS_AUDIO_ID}.opus">`;
+  if (skillId) {
+    result.response.tts =
+      `<speaker audio="dialogs-upload/${skillId}/${JARVIS_AUDIO_ID}.opus">`;
+  } else {
+    console.warn(
+      "Jarvis audio test: skill_id is missing."
+    );
+  }
 
   return result;
 }
@@ -423,15 +427,19 @@ export default async function handler(req, res) {
     body?.state?.session?.history
   );
 
-  // Команда проверки голоса.
-  // Выполняется до Gemini и Serper.
+  // Яндекс автоматически передаёт ID навыка.
+  const skillId = String(
+    body?.session?.skill_id || ""
+  ).trim();
+
+  // Проверка голоса без Gemini и Serper.
   if (isVoiceTestCommand(text)) {
     console.log(
       "Jarvis audio test: no Gemini request."
     );
 
     return res.status(200).json(
-      jarvisVoiceTest(oldHistory)
+      jarvisVoiceTest(skillId, oldHistory)
     );
   }
 
