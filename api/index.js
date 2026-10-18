@@ -11,14 +11,17 @@ const GEMINI_TIMEOUT_MS = 3500;
 
 const FISH_VOICE_ID = "c47719f52ce34cc193b9bc2f00565e8a";
 const FISH_MODEL = "s2.1-pro-free";
-
 const FISH_TIMEOUT_MS = 3000;
 const YANDEX_TIMEOUT_MS = 900;
 
 const DIAGNOSTIC_FISH_TIMEOUT_MS = 25000;
 const DIAGNOSTIC_YANDEX_TIMEOUT_MS = 12000;
+const DIAGNOSTIC_POLL_BUDGET_MS = 12000;
+const DIAGNOSTIC_POLL_INTERVAL_MS = 1000;
+
 const JARVIS_AUDIO_ID =
   "8fd14dac-b03e-4304-943c-e8f1613b9701";
+
 const TEST_PHRASE =
   "Сэр, голосовой модуль Джарвиса подключён. " +
   "Все системы готовы к дальнейшим испытаниям.";
@@ -161,6 +164,10 @@ function safeHistory(history) {
       role: item.role,
       text: item.text.slice(0, MAX_HISTORY_MESSAGE_CHARS)
     }));
+}
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 async function fetchJson(url, options, timeoutMs) {
@@ -417,8 +424,6 @@ async function getYandexSound(
   return data?.sound || null;
 }
 
-// Защищённый диагностический режим.
-// Секрет передаётся в заголовке, не в адресе страницы.
 function diagnosticAuthorized(req) {
   const expected = process.env.JARVIS_DIAGNOSTIC_TOKEN;
 
@@ -457,6 +462,66 @@ function diagnosticError(error) {
   ).slice(0, 80);
 }
 
+async function pollYandexProcessing(
+  skillId,
+  soundId,
+  maxWaitMs
+) {
+  const startedAt = Date.now();
+  let attempts = 0;
+  let lastError = null;
+
+  while (Date.now() - startedAt < maxWaitMs) {
+    const remaining =
+      maxWaitMs - (Date.now() - startedAt);
+
+    if (remaining <= 200) break;
+
+    attempts++;
+
+    try {
+      const sound = await getYandexSound(
+        skillId,
+        soundId,
+        Math.min(2500, remaining)
+      );
+
+      if (sound?.isProcessed === true) {
+        return {
+          processed: true,
+          attempts,
+          elapsedMs: Date.now() - startedAt,
+          error: null
+        };
+      }
+
+      lastError = null;
+    } catch (error) {
+      lastError = diagnosticError(error);
+      console.warn(
+        "Yandex processing poll:",
+        lastError
+      );
+    }
+
+    const timeLeft =
+      maxWaitMs - (Date.now() - startedAt);
+
+    if (timeLeft > 200) {
+      await sleep(
+        Math.min(DIAGNOSTIC_POLL_INTERVAL_MS, timeLeft)
+      );
+    }
+  }
+
+  return {
+    processed: false,
+    attempts,
+    elapsedMs: Date.now() - startedAt,
+    error: lastError
+  };
+}
+
 async function handleDiagnostic(req, res) {
   res.setHeader("Cache-Control", "no-store");
 
@@ -493,6 +558,8 @@ async function handleDiagnostic(req, res) {
       });
     }
 
+    const startedAt = Date.now();
+
     try {
       const sound = await getYandexSound(
         skillId,
@@ -505,6 +572,7 @@ async function handleDiagnostic(req, res) {
         action,
         soundId,
         processed: sound?.isProcessed === true,
+        statusRequestMs: Date.now() - startedAt,
         sound: sound
           ? {
               id: sound.id,
@@ -516,7 +584,8 @@ async function handleDiagnostic(req, res) {
       return res.status(200).json({
         ok: false,
         stage: "yandex_status",
-        error: diagnosticError(error)
+        error: diagnosticError(error),
+        statusRequestMs: Date.now() - startedAt
       });
     }
   }
@@ -528,43 +597,113 @@ async function handleDiagnostic(req, res) {
     });
   }
 
+  const totalStartedAt = Date.now();
+
   let audio;
+  let fishMs = null;
+  let uploadMs = null;
+  let soundId = null;
+
+  const fishStartedAt = Date.now();
 
   try {
     audio = await generateFishAudio(
       TEST_PHRASE,
       DIAGNOSTIC_FISH_TIMEOUT_MS
     );
+
+    fishMs = Date.now() - fishStartedAt;
   } catch (error) {
     return res.status(200).json({
       ok: false,
       stage: "fish",
-      error: diagnosticError(error)
+      error: diagnosticError(error),
+      timings: {
+        fishMs: Date.now() - fishStartedAt,
+        totalMs: Date.now() - totalStartedAt
+      }
     });
   }
 
+  const uploadStartedAt = Date.now();
+  let sound;
+
   try {
-    const sound = await uploadYandexSound(
+    sound = await uploadYandexSound(
       skillId,
       audio,
       DIAGNOSTIC_YANDEX_TIMEOUT_MS
     );
 
-    return res.status(200).json({
-      ok: true,
-      stage: "uploaded",
-      soundId: sound.id,
-      processed: sound.isProcessed === true,
-      audioBytes: audio.byteLength
-    });
+    uploadMs = Date.now() - uploadStartedAt;
+    soundId = sound.id;
   } catch (error) {
     return res.status(200).json({
       ok: false,
       stage: "yandex_upload",
       error: diagnosticError(error),
-      audioBytes: audio.byteLength
+      audioBytes: audio.byteLength,
+      timings: {
+        fishMs,
+        uploadMs: Date.now() - uploadStartedAt,
+        totalMs: Date.now() - totalStartedAt
+      }
     });
   }
+
+  let processed = sound.isProcessed === true;
+  let processingMs = 0;
+  let processingAttempts = 0;
+  let processingError = null;
+
+  if (!processed) {
+    const result = await pollYandexProcessing(
+      skillId,
+      soundId,
+      DIAGNOSTIC_POLL_BUDGET_MS
+    );
+
+    processed = result.processed;
+    processingMs = result.elapsedMs;
+    processingAttempts = result.attempts;
+    processingError = result.error;
+  }
+
+  const totalMs = Date.now() - totalStartedAt;
+
+  console.log(
+    "Jarvis diagnostic timings:",
+    JSON.stringify({
+      fishMs,
+      uploadMs,
+      processingMs,
+      totalMs,
+      processed
+    })
+  );
+
+  return res.status(200).json({
+    ok: true,
+    stage: processed
+      ? "ready"
+      : "uploaded",
+    soundId,
+    processed,
+    audioBytes: audio.byteLength,
+    timings: {
+      fishMs,
+      uploadMs,
+      processingMs,
+      totalMs
+    },
+    processingAttempts,
+    processingError,
+    withinAliceLimit:
+      processed && totalMs <= 4500,
+    note: processed
+      ? "Audio ready for playback."
+      : "Audio uploaded. Processing not confirmed within polling window."
+  });
 }
 
 async function searchWeb(query, timeoutMs) {
@@ -831,13 +970,13 @@ function fishErrorForUser(error) {
       return "Fish Audio отклонил API-ключ или доступ к бесплатной модели.";
 
     case "FISH_PAYMENT_REQUIRED":
-      return "Fish Audio по-прежнему требует оплату. Бесплатный режим для этого запроса недоступен.";
+      return "Fish Audio требует оплату для этого запроса.";
 
     case "FISH_MODEL_NOT_FOUND":
-      return "Fish Audio не нашёл бесплатную модель. Возможно, её название или доступ изменились.";
+      return "Fish Audio не нашёл бесплатную модель.";
 
     case "FISH_INVALID_REQUEST":
-      return "Fish Audio отклонил параметры запроса. Подробности находятся в журнале Vercel.";
+      return "Fish Audio отклонил параметры запроса.";
 
     case "FISH_RATE_LIMIT":
       return "Fish Audio временно ограничил количество запросов.";
@@ -858,7 +997,7 @@ function fishErrorForUser(error) {
       return "Не удалось загрузить звук в Яндекс Диалоги.";
 
     case "YANDEX_NO_SOUND_ID":
-      return "Яндекс принял запрос, но не вернул идентификатор звука.";
+      return "Яндекс не вернул идентификатор звука.";
 
     case "AbortError":
       return "Голосовой сервис не успел ответить за отведённое время.";
@@ -881,6 +1020,7 @@ export default async function handler(req, res) {
       diagnosticConfigured: Boolean(
         process.env.JARVIS_DIAGNOSTIC_TOKEN
       ),
+      timingDiagnostics: true,
       message: "Webhook is ready."
     });
   }
@@ -893,8 +1033,6 @@ export default async function handler(req, res) {
     });
   }
 
-  // Отдельный диагностический режим.
-  // Обычные запросы Алисы не затрагиваются.
   if (
     req.headers["x-jarvis-diagnostic-token"] !==
     undefined
@@ -990,7 +1128,7 @@ export default async function handler(req, res) {
 
       return res.status(200).json(
         aliceResponse(
-          "Проверка завершена успешно. Бесплатная модель Fish Audio создала голос Джарвиса. Теперь можно проверить загрузку записи в Яндекс Диалоги.",
+          "Проверка завершена успешно. Бесплатная модель Fish Audio создала голос Джарвиса.",
           false,
           oldHistory
         )
@@ -1055,7 +1193,7 @@ export default async function handler(req, res) {
 
       return res.status(200).json(
         aliceResponse(
-          "Fish Audio создал запись, а Яндекс принял её на обработку. Идентификатор записи сохранён в журнале Vercel. Для воспроизведения нужно дождаться обработки.",
+          "Fish Audio создал запись, а Яндекс принял её на обработку. Идентификатор записи сохранён в журнале Vercel.",
           false,
           oldHistory
         )
