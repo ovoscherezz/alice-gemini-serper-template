@@ -17,10 +17,8 @@ const YANDEX_TIMEOUT_MS = 900;
 
 const DIAGNOSTIC_FISH_TIMEOUT_MS = 25000;
 const DIAGNOSTIC_YANDEX_TIMEOUT_MS = 12000;
-
 const JARVIS_AUDIO_ID =
-  "df9659fd-b6ef-4455-b2ea-e6546088a040";
-
+  "8fd14dac-b03e-4304-943c-e8f1613b9701";
 const TEST_PHRASE =
   "Сэр, голосовой модуль Джарвиса подключён. " +
   "Все системы готовы к дальнейшим испытаниям.";
