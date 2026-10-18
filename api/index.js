@@ -10,8 +10,12 @@ const SERPER_TIMEOUT_MS = 400;
 const GEMINI_TIMEOUT_MS = 3500;
 
 const FISH_VOICE_ID = "c47719f52ce34cc193b9bc2f00565e8a";
-const FISH_MODEL = "s2.1-pro";
-const FISH_TIMEOUT_MS = 2600;
+
+// Пробуем бесплатную модель Fish Audio.
+// Платная модель s2.1-pro пока не используется.
+const FISH_MODEL = "s2.1-pro-free";
+
+const FISH_TIMEOUT_MS = 3000;
 const YANDEX_TIMEOUT_MS = 900;
 
 const JARVIS_AUDIO_ID =
@@ -20,6 +24,9 @@ const JARVIS_AUDIO_ID =
 const TEST_PHRASE =
   "Сэр, голосовой модуль Джарвиса подключён. " +
   "Все системы готовы к дальнейшим испытаниям.";
+
+const FISH_CHECK_PHRASE =
+  "Сэр, бесплатный голосовой модуль Джарвиса проходит проверку.";
 
 const TTS_EFFECT =
   process.env.JARVIS_TTS_EFFECT === "pitch_down"
@@ -109,7 +116,8 @@ function audioResponse(
   return result;
 }
 
-// Старая проверка голоса: оставлена без изменений.
+// Проверка ранее загруженного голоса.
+// Сохраняем рабочий способ воспроизведения.
 function jarvisVoiceTest(skillId, history = []) {
   return audioResponse(
     "Добрый вечер, сэр. Все системы работают в штатном режиме. Чем могу быть полезен?",
@@ -133,6 +141,17 @@ function isConnectionTestCommand(text) {
 
 function isFishTestCommand(text) {
   return /^(джарвис[\s,.!]*)?создай тестовый голос[.!?]*$/i.test(
+    String(text || "").trim()
+  );
+}
+
+// Новая команда: проверяет только Fish Audio.
+// Не вызывает Gemini и не загружает файл в Яндекс.
+function isFishConnectionTestCommand(text) {
+  return /^(джарвис[\s,.!]*)?проверка fish audio[.!?]*$/i.test(
+    String(text || "").trim()
+  ) ||
+  /^(джарвис[\s,.!]*)?проверка фиш аудио[.!?]*$/i.test(
     String(text || "").trim()
   );
 }
@@ -180,8 +199,6 @@ async function fetchJson(url, options, timeoutMs) {
   }
 }
 
-// Проверяет доступ к API Яндекс Диалогов.
-// Токен никогда не выводится в лог.
 async function checkYandexConnection(timeoutMs) {
   const token = process.env.YANDEX_OAUTH_TOKEN;
 
@@ -213,7 +230,7 @@ async function checkYandexConnection(timeoutMs) {
   return data;
 }
 
-// Создаёт MP3 голосом Fish Audio.
+// Генерирует MP3 через бесплатную модель Fish Audio.
 async function generateFishAudio(text, timeoutMs) {
   const key = process.env.FISH_API_KEY;
 
@@ -229,6 +246,9 @@ async function generateFishAudio(text, timeoutMs) {
   );
 
   try {
+    console.log("Fish model:", FISH_MODEL);
+    console.log("Fish voice ID:", FISH_VOICE_ID);
+
     const response = await fetch(
       "https://api.fish.audio/v1/tts",
       {
@@ -250,12 +270,35 @@ async function generateFishAudio(text, timeoutMs) {
     if (!response.ok) {
       console.warn("Fish Audio HTTP:", response.status);
 
+      let errorBody = "";
+
+      try {
+        errorBody = await response.text();
+      } catch {
+        errorBody = "";
+      }
+
+      // Не выводим в журнал ключи и другие секреты.
+      // Показываем только ограниченную диагностическую информацию.
+      console.warn(
+        "Fish error details:",
+        errorBody.slice(0, 500)
+      );
+
       if (response.status === 401 || response.status === 403) {
         throw new Error("FISH_AUTH_FAILED");
       }
 
       if (response.status === 402) {
         throw new Error("FISH_PAYMENT_REQUIRED");
+      }
+
+      if (response.status === 404) {
+        throw new Error("FISH_MODEL_NOT_FOUND");
+      }
+
+      if (response.status === 422) {
+        throw new Error("FISH_INVALID_REQUEST");
       }
 
       if (response.status === 429) {
@@ -285,7 +328,10 @@ async function generateFishAudio(text, timeoutMs) {
       throw new Error("FISH_AUDIO_TOO_LARGE");
     }
 
-    console.log("Fish audio bytes:", audio.byteLength);
+    console.log(
+      "Fish audio generated successfully. Bytes:",
+      audio.byteLength
+    );
 
     return audio;
   } finally {
@@ -293,7 +339,6 @@ async function generateFishAudio(text, timeoutMs) {
   }
 }
 
-// Загружает MP3 в ресурсы конкретного навыка.
 async function uploadYandexSound(
   skillId,
   audioBuffer,
@@ -351,7 +396,6 @@ async function uploadYandexSound(
   return sound;
 }
 
-// Проверяет, готов ли загруженный звук.
 async function getYandexSound(
   skillId,
   soundId,
@@ -623,10 +667,16 @@ function fishErrorForUser(error) {
       return "OAuth-токен Яндекса не найден в настройках Vercel.";
 
     case "FISH_AUTH_FAILED":
-      return "Fish Audio отклонил API-ключ.";
+      return "Fish Audio отклонил API-ключ или доступ к бесплатной модели.";
 
     case "FISH_PAYMENT_REQUIRED":
-      return "Fish Audio требует проверить баланс или доступ к модели.";
+      return "Fish Audio по-прежнему требует оплату. Бесплатный режим для этого запроса недоступен.";
+
+    case "FISH_MODEL_NOT_FOUND":
+      return "Fish Audio не нашёл бесплатную модель. Возможно, её название или доступ изменились.";
+
+    case "FISH_INVALID_REQUEST":
+      return "Fish Audio отклонил параметры запроса. Подробности находятся в журнале Vercel.";
 
     case "FISH_RATE_LIMIT":
       return "Fish Audio временно ограничил количество запросов.";
@@ -663,6 +713,7 @@ export default async function handler(req, res) {
       ok: true,
       service: "alice-gemini-serper",
       fishConfigured: Boolean(process.env.FISH_API_KEY),
+      fishModel: FISH_MODEL,
       yandexConfigured: Boolean(process.env.YANDEX_OAUTH_TOKEN),
       message: "Webhook is ready."
     });
@@ -700,7 +751,7 @@ export default async function handler(req, res) {
     body?.session?.skill_id || ""
   ).trim();
 
-  // Старая рабочая проверка голоса.
+  // Проверка ранее загруженного голоса.
   if (isVoiceTestCommand(text)) {
     console.log("Jarvis audio test: no Gemini request.");
 
@@ -709,7 +760,7 @@ export default async function handler(req, res) {
     );
   }
 
-  // Проверка авторизации Яндекса без Gemini и Fish Audio.
+  // Проверка подключения к Яндекс Диалогам.
   if (isConnectionTestCommand(text)) {
     try {
       const status = await checkYandexConnection(
@@ -744,8 +795,50 @@ export default async function handler(req, res) {
     }
   }
 
-  // Экспериментальный тест создания и загрузки нового голоса.
-  // Не использует Gemini и Serper.
+  // Новая отдельная проверка бесплатного Fish Audio.
+  // Не загружает запись в Яндекс Диалоги.
+  if (isFishConnectionTestCommand(text)) {
+    try {
+      const audio = await generateFishAudio(
+        FISH_CHECK_PHRASE,
+        Math.min(
+          FISH_TIMEOUT_MS,
+          Math.max(100, remainingMs() - 400)
+        )
+      );
+
+      console.log(
+        "Free Fish Audio test succeeded. Bytes:",
+        audio.byteLength
+      );
+
+      return res.status(200).json(
+        aliceResponse(
+          "Проверка завершена успешно. Бесплатная модель Fish Audio создала голос Джарвиса. " +
+          "Теперь можно проверить загрузку записи в Яндекс Диалоги.",
+          false,
+          oldHistory
+        )
+      );
+    } catch (error) {
+      console.warn(
+        "Free Fish Audio test failed:",
+        error?.name === "AbortError"
+          ? "AbortError"
+          : error?.message || "unknown"
+      );
+
+      return res.status(200).json(
+        aliceResponse(
+          fishErrorForUser(error),
+          false,
+          oldHistory
+        )
+      );
+    }
+  }
+
+  // Генерация тестового голоса и загрузка в Яндекс.
   if (isFishTestCommand(text)) {
     try {
       if (!skillId) {
@@ -769,8 +862,6 @@ export default async function handler(req, res) {
         )
       );
 
-      // Яндекс может ещё обрабатывать загруженный звук.
-      // Не пытаемся воспроизвести неготовый файл.
       if (sound.isProcessed === true) {
         return res.status(200).json(
           audioResponse(
@@ -898,5 +989,6 @@ export {
   isVoiceTestCommand,
   jarvisVoiceTest,
   isConnectionTestCommand,
-  isFishTestCommand
+  isFishTestCommand,
+  isFishConnectionTestCommand
 };
