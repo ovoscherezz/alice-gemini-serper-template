@@ -1,13 +1,19 @@
 
 const DEFAULT_MODEL = "gemini-2.5-flash-lite";
+
 const MAX_HISTORY_MESSAGES = 8;
 const MAX_HISTORY_MESSAGE_CHARS = 1200;
 const MAX_ALICE_TEXT = 1024;
+
 const TOTAL_RESPONSE_BUDGET_MS = 4200;
 const SERPER_TIMEOUT_MS = 400;
 const GEMINI_TIMEOUT_MS = 3500;
 
-// Необязательная настройка в Vercel:
+// Загруженный в Яндекс Диалоги звук Джарвиса.
+const JARVIS_AUDIO_ID =
+  "df9659fd-b6ef-4455-b2ea-e6546088a040";
+
+// Необязательная настройка Vercel:
 // JARVIS_TTS_EFFECT = pitch_down
 const TTS_EFFECT =
   process.env.JARVIS_TTS_EFFECT === "pitch_down"
@@ -36,6 +42,7 @@ function fitAliceText(value) {
   }
 
   const candidate = text.slice(0, MAX_ALICE_TEXT - 1);
+
   const sentenceEnd = Math.max(
     candidate.lastIndexOf(". "),
     candidate.lastIndexOf("! "),
@@ -78,6 +85,27 @@ function aliceResponse(text, endSession = false, history = []) {
     response,
     session_state: { history }
   };
+}
+
+// Проверка загруженного голоса без обращения к Gemini.
+function jarvisVoiceTest(history = []) {
+  const result = aliceResponse(
+    "Добрый вечер, сэр. Все системы работают в штатном режиме. Чем могу быть полезен?",
+    false,
+    history
+  );
+
+  // Синтаксис звуковых ресурсов Яндекс Диалогов.
+  result.response.tts =
+    `<speaker audio="dialogs-upload/${JARVIS_AUDIO_ID}.opus">`;
+
+  return result;
+}
+
+function isVoiceTestCommand(text) {
+  return /^(джарвис[\s,.!]*)?проверка голоса[.!?]*$/i.test(
+    String(text || "").trim()
+  );
 }
 
 function isSearchIntent(text) {
@@ -182,15 +210,23 @@ async function searchWeb(query, timeoutMs) {
   }
 }
 
-async function askGemini(text, history, searchContext, timeoutMs) {
+async function askGemini(
+  text,
+  history,
+  searchContext,
+  timeoutMs
+) {
   const key = process.env.GEMINI_API_KEY;
 
-  if (!key) throw new Error("MISSING_GEMINI_KEY");
+  if (!key) {
+    throw new Error("MISSING_GEMINI_KEY");
+  }
 
   if (timeoutMs < 250) {
     throw new Error("TIME_BUDGET_EXHAUSTED");
   }
 
+  // Модель из Vercel имеет приоритет.
   const model = String(
     process.env.GEMINI_MODEL || DEFAULT_MODEL
   ).trim();
@@ -387,6 +423,18 @@ export default async function handler(req, res) {
     body?.state?.session?.history
   );
 
+  // Команда проверки голоса.
+  // Выполняется до Gemini и Serper.
+  if (isVoiceTestCommand(text)) {
+    console.log(
+      "Jarvis audio test: no Gemini request."
+    );
+
+    return res.status(200).json(
+      jarvisVoiceTest(oldHistory)
+    );
+  }
+
   if (!text) {
     return res.status(200).json(
       aliceResponse(
@@ -430,11 +478,17 @@ export default async function handler(req, res) {
       ...oldHistory,
       {
         role: "user",
-        text: text.slice(0, MAX_HISTORY_MESSAGE_CHARS)
+        text: text.slice(
+          0,
+          MAX_HISTORY_MESSAGE_CHARS
+        )
       },
       {
         role: "model",
-        text: answer.slice(0, MAX_HISTORY_MESSAGE_CHARS)
+        text: answer.slice(
+          0,
+          MAX_HISTORY_MESSAGE_CHARS
+        )
       }
     ].slice(-MAX_HISTORY_MESSAGES);
 
@@ -466,5 +520,7 @@ export {
   aliceResponse,
   fitAliceText,
   isSearchIntent,
-  safeHistory
+  safeHistory,
+  isVoiceTestCommand,
+  jarvisVoiceTest
 };
