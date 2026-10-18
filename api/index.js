@@ -9,9 +9,17 @@ const TOTAL_RESPONSE_BUDGET_MS = 4200;
 const SERPER_TIMEOUT_MS = 400;
 const GEMINI_TIMEOUT_MS = 3500;
 
-// Идентификатор аудиофайла, загруженного в Яндекс Диалоги.
+const FISH_VOICE_ID = "c47719f52ce34cc193b9bc2f00565e8a";
+const FISH_MODEL = "s2.1-pro";
+const FISH_TIMEOUT_MS = 2600;
+const YANDEX_TIMEOUT_MS = 900;
+
 const JARVIS_AUDIO_ID =
   "df9659fd-b6ef-4455-b2ea-e6546088a040";
+
+const TEST_PHRASE =
+  "Сэр, голосовой модуль Джарвиса подключён. " +
+  "Все системы готовы к дальнейшим испытаниям.";
 
 const TTS_EFFECT =
   process.env.JARVIS_TTS_EFFECT === "pitch_down"
@@ -85,29 +93,46 @@ function aliceResponse(text, endSession = false, history = []) {
   };
 }
 
-// Проверка загруженного голоса без Gemini.
-// ID навыка автоматически приходит от Яндекса.
-function jarvisVoiceTest(skillId, history = []) {
-  const result = aliceResponse(
-    "Добрый вечер, сэр. Все системы работают в штатном режиме. Чем могу быть полезен?",
-    false,
-    history
-  );
+function audioResponse(
+  text,
+  skillId,
+  audioId,
+  history = []
+) {
+  const result = aliceResponse(text, false, history);
 
-  if (skillId) {
+  if (skillId && audioId) {
     result.response.tts =
-      `<speaker audio="dialogs-upload/${skillId}/${JARVIS_AUDIO_ID}.opus">`;
-  } else {
-    console.warn(
-      "Jarvis audio test: skill_id is missing."
-    );
+      `<speaker audio="dialogs-upload/${skillId}/${audioId}.opus">`;
   }
 
   return result;
 }
 
+// Старая проверка голоса: оставлена без изменений.
+function jarvisVoiceTest(skillId, history = []) {
+  return audioResponse(
+    "Добрый вечер, сэр. Все системы работают в штатном режиме. Чем могу быть полезен?",
+    skillId,
+    JARVIS_AUDIO_ID,
+    history
+  );
+}
+
 function isVoiceTestCommand(text) {
   return /^(джарвис[\s,.!]*)?проверка голоса[.!?]*$/i.test(
+    String(text || "").trim()
+  );
+}
+
+function isConnectionTestCommand(text) {
+  return /^(джарвис[\s,.!]*)?проверка подключения[.!?]*$/i.test(
+    String(text || "").trim()
+  );
+}
+
+function isFishTestCommand(text) {
+  return /^(джарвис[\s,.!]*)?создай тестовый голос[.!?]*$/i.test(
     String(text || "").trim()
   );
 }
@@ -153,6 +178,207 @@ async function fetchJson(url, options, timeoutMs) {
   } finally {
     clearTimeout(timer);
   }
+}
+
+// Проверяет доступ к API Яндекс Диалогов.
+// Токен никогда не выводится в лог.
+async function checkYandexConnection(timeoutMs) {
+  const token = process.env.YANDEX_OAUTH_TOKEN;
+
+  if (!token) {
+    throw new Error("MISSING_YANDEX_TOKEN");
+  }
+
+  const { response, data } = await fetchJson(
+    "https://dialogs.yandex.net/api/v1/status",
+    {
+      method: "GET",
+      headers: {
+        Authorization: `OAuth ${token}`
+      }
+    },
+    timeoutMs
+  );
+
+  if (!response.ok) {
+    console.warn("Yandex status HTTP:", response.status);
+
+    if (response.status === 401 || response.status === 403) {
+      throw new Error("YANDEX_AUTH_FAILED");
+    }
+
+    throw new Error("YANDEX_API_FAILED");
+  }
+
+  return data;
+}
+
+// Создаёт MP3 голосом Fish Audio.
+async function generateFishAudio(text, timeoutMs) {
+  const key = process.env.FISH_API_KEY;
+
+  if (!key) {
+    throw new Error("MISSING_FISH_KEY");
+  }
+
+  const controller = new AbortController();
+
+  const timer = setTimeout(
+    () => controller.abort(),
+    Math.max(100, timeoutMs)
+  );
+
+  try {
+    const response = await fetch(
+      "https://api.fish.audio/v1/tts",
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${key}`,
+          "Content-Type": "application/json",
+          model: FISH_MODEL
+        },
+        body: JSON.stringify({
+          text,
+          reference_id: FISH_VOICE_ID,
+          format: "mp3"
+        }),
+        signal: controller.signal
+      }
+    );
+
+    if (!response.ok) {
+      console.warn("Fish Audio HTTP:", response.status);
+
+      if (response.status === 401 || response.status === 403) {
+        throw new Error("FISH_AUTH_FAILED");
+      }
+
+      if (response.status === 402) {
+        throw new Error("FISH_PAYMENT_REQUIRED");
+      }
+
+      if (response.status === 429) {
+        throw new Error("FISH_RATE_LIMIT");
+      }
+
+      throw new Error("FISH_API_FAILED");
+    }
+
+    const contentType =
+      response.headers.get("content-type") || "";
+
+    if (
+      contentType.includes("application/json") ||
+      contentType.includes("text/html")
+    ) {
+      throw new Error("FISH_INVALID_AUDIO");
+    }
+
+    const audio = await response.arrayBuffer();
+
+    if (audio.byteLength < 1000) {
+      throw new Error("FISH_INVALID_AUDIO");
+    }
+
+    if (audio.byteLength > 5 * 1024 * 1024) {
+      throw new Error("FISH_AUDIO_TOO_LARGE");
+    }
+
+    console.log("Fish audio bytes:", audio.byteLength);
+
+    return audio;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Загружает MP3 в ресурсы конкретного навыка.
+async function uploadYandexSound(
+  skillId,
+  audioBuffer,
+  timeoutMs
+) {
+  const token = process.env.YANDEX_OAUTH_TOKEN;
+
+  if (!token) {
+    throw new Error("MISSING_YANDEX_TOKEN");
+  }
+
+  if (!skillId) {
+    throw new Error("MISSING_SKILL_ID");
+  }
+
+  const form = new FormData();
+
+  form.append(
+    "file",
+    new Blob([audioBuffer], { type: "audio/mpeg" }),
+    "jarvis-test.mp3"
+  );
+
+  const { response, data } = await fetchJson(
+    `https://dialogs.yandex.net/api/v1/skills/${encodeURIComponent(skillId)}/sounds`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `OAuth ${token}`
+      },
+      body: form
+    },
+    timeoutMs
+  );
+
+  if (!response.ok) {
+    console.warn("Yandex upload HTTP:", response.status);
+
+    if (response.status === 401 || response.status === 403) {
+      throw new Error("YANDEX_AUTH_FAILED");
+    }
+
+    throw new Error("YANDEX_UPLOAD_FAILED");
+  }
+
+  const sound = data?.sound;
+
+  if (!sound?.id) {
+    throw new Error("YANDEX_NO_SOUND_ID");
+  }
+
+  console.log("Yandex uploaded sound ID:", sound.id);
+  console.log("Yandex processed:", sound.isProcessed);
+
+  return sound;
+}
+
+// Проверяет, готов ли загруженный звук.
+async function getYandexSound(
+  skillId,
+  soundId,
+  timeoutMs
+) {
+  const token = process.env.YANDEX_OAUTH_TOKEN;
+
+  if (!token) {
+    throw new Error("MISSING_YANDEX_TOKEN");
+  }
+
+  const { response, data } = await fetchJson(
+    `https://dialogs.yandex.net/api/v1/skills/${encodeURIComponent(skillId)}/sounds/${encodeURIComponent(soundId)}`,
+    {
+      method: "GET",
+      headers: {
+        Authorization: `OAuth ${token}`
+      }
+    },
+    timeoutMs
+  );
+
+  if (!response.ok) {
+    throw new Error("YANDEX_SOUND_STATUS_FAILED");
+  }
+
+  return data?.sound || null;
 }
 
 async function searchWeb(query, timeoutMs) {
@@ -230,7 +456,6 @@ async function askGemini(
     throw new Error("TIME_BUDGET_EXHAUSTED");
   }
 
-  // Модель из Vercel имеет приоритет.
   const model = String(
     process.env.GEMINI_MODEL || DEFAULT_MODEL
   ).trim();
@@ -389,13 +614,57 @@ function errorForUser(error) {
   }
 }
 
+function fishErrorForUser(error) {
+  switch (error?.message) {
+    case "MISSING_FISH_KEY":
+      return "Ключ Fish Audio не найден в настройках Vercel.";
+
+    case "MISSING_YANDEX_TOKEN":
+      return "OAuth-токен Яндекса не найден в настройках Vercel.";
+
+    case "FISH_AUTH_FAILED":
+      return "Fish Audio отклонил API-ключ.";
+
+    case "FISH_PAYMENT_REQUIRED":
+      return "Fish Audio требует проверить баланс или доступ к модели.";
+
+    case "FISH_RATE_LIMIT":
+      return "Fish Audio временно ограничил количество запросов.";
+
+    case "YANDEX_AUTH_FAILED":
+      return "Яндекс отклонил OAuth-токен или доступ к навыку.";
+
+    case "MISSING_SKILL_ID":
+      return "Яндекс не передал идентификатор навыка.";
+
+    case "FISH_AUDIO_TOO_LARGE":
+      return "Созданный аудиофайл превышает лимит Яндекса.";
+
+    case "FISH_INVALID_AUDIO":
+      return "Fish Audio вернул некорректный аудиофайл.";
+
+    case "YANDEX_UPLOAD_FAILED":
+      return "Не удалось загрузить звук в Яндекс Диалоги.";
+
+    case "YANDEX_NO_SOUND_ID":
+      return "Яндекс принял запрос, но не вернул идентификатор звука.";
+
+    case "AbortError":
+      return "Голосовой сервис не успел ответить за отведённое время.";
+
+    default:
+      return "Тест голосового модуля завершился ошибкой. Проверьте журнал Vercel.";
+  }
+}
+
 export default async function handler(req, res) {
   if (req.method === "GET") {
     return res.status(200).json({
       ok: true,
       service: "alice-gemini-serper",
-      message:
-        "Webhook is ready. Yandex Dialogs should send POST requests to /api."
+      fishConfigured: Boolean(process.env.FISH_API_KEY),
+      yandexConfigured: Boolean(process.env.YANDEX_OAUTH_TOKEN),
+      message: "Webhook is ready."
     });
   }
 
@@ -427,20 +696,117 @@ export default async function handler(req, res) {
     body?.state?.session?.history
   );
 
-  // Яндекс автоматически передаёт ID навыка.
   const skillId = String(
     body?.session?.skill_id || ""
   ).trim();
 
-  // Проверка голоса без Gemini и Serper.
+  // Старая рабочая проверка голоса.
   if (isVoiceTestCommand(text)) {
-    console.log(
-      "Jarvis audio test: no Gemini request."
-    );
+    console.log("Jarvis audio test: no Gemini request.");
 
     return res.status(200).json(
       jarvisVoiceTest(skillId, oldHistory)
     );
+  }
+
+  // Проверка авторизации Яндекса без Gemini и Fish Audio.
+  if (isConnectionTestCommand(text)) {
+    try {
+      const status = await checkYandexConnection(
+        Math.min(2500, remainingMs() - 300)
+      );
+
+      console.log(
+        "Yandex connection OK. Sound quota:",
+        JSON.stringify(status?.sounds?.quota || {})
+      );
+
+      return res.status(200).json(
+        aliceResponse(
+          "Подключение к Яндекс Диалогам работает. OAuth-токен принят.",
+          false,
+          oldHistory
+        )
+      );
+    } catch (error) {
+      console.warn(
+        "Yandex connection test failed:",
+        error?.message || "unknown"
+      );
+
+      return res.status(200).json(
+        aliceResponse(
+          fishErrorForUser(error),
+          false,
+          oldHistory
+        )
+      );
+    }
+  }
+
+  // Экспериментальный тест создания и загрузки нового голоса.
+  // Не использует Gemini и Serper.
+  if (isFishTestCommand(text)) {
+    try {
+      if (!skillId) {
+        throw new Error("MISSING_SKILL_ID");
+      }
+
+      const audio = await generateFishAudio(
+        TEST_PHRASE,
+        Math.min(
+          FISH_TIMEOUT_MS,
+          Math.max(100, remainingMs() - 1200)
+        )
+      );
+
+      const sound = await uploadYandexSound(
+        skillId,
+        audio,
+        Math.min(
+          YANDEX_TIMEOUT_MS,
+          Math.max(100, remainingMs() - 300)
+        )
+      );
+
+      // Яндекс может ещё обрабатывать загруженный звук.
+      // Не пытаемся воспроизвести неготовый файл.
+      if (sound.isProcessed === true) {
+        return res.status(200).json(
+          audioResponse(
+            TEST_PHRASE,
+            skillId,
+            sound.id,
+            oldHistory
+          )
+        );
+      }
+
+      return res.status(200).json(
+        aliceResponse(
+          "Fish Audio создал запись, а Яндекс принял её на обработку. " +
+          "Идентификатор записи сохранён в журнале Vercel. " +
+          "Для воспроизведения нужно дождаться обработки.",
+          false,
+          oldHistory
+        )
+      );
+    } catch (error) {
+      console.warn(
+        "Fish voice test failed:",
+        error?.name === "AbortError"
+          ? "AbortError"
+          : error?.message || "unknown"
+      );
+
+      return res.status(200).json(
+        aliceResponse(
+          fishErrorForUser(error),
+          false,
+          oldHistory
+        )
+      );
+    }
   }
 
   if (!text) {
@@ -530,5 +896,7 @@ export {
   isSearchIntent,
   safeHistory,
   isVoiceTestCommand,
-  jarvisVoiceTest
+  jarvisVoiceTest,
+  isConnectionTestCommand,
+  isFishTestCommand
 };
